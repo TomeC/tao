@@ -32,11 +32,14 @@ var (
 	ErrServerClosed  = errors.New("server has been closed")
 )
 
+// definitions about some constants.
 const (
-	// WorkersNum is the number of worker go-routines.
-	WorkersNum = 20
-	// MaxConnections is the maximum number of client connections allowed.
-	MaxConnections = 1000
+	MaxConnections    = 1000
+	BufferSize128     = 128
+	BufferSize256     = 256
+	BufferSize512     = 512
+	BufferSize1024    = 1024
+	defaultWorkersNum = 20
 )
 
 type onConnectFunc func(WriteCloser) bool

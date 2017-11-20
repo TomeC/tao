@@ -60,9 +60,9 @@ func NewServerConn(id int64, s *Server, c net.Conn) *ServerConn {
 		rawConn:   c,
 		once:      &sync.Once{},
 		wg:        &sync.WaitGroup{},
-		sendCh:    make(chan []byte, 1024),
-		handlerCh: make(chan MessageHandler, 1024),
-		timerCh:   make(chan *OnTimeOut, 1024),
+		sendCh:    make(chan []byte, s.opts.bufferSize),
+		handlerCh: make(chan MessageHandler, s.opts.bufferSize),
+		timerCh:   make(chan *OnTimeOut, s.opts.bufferSize),
 		heart:     time.Now().UnixNano(),
 	}
 	sc.ctx, sc.cancel = context.WithCancel(context.WithValue(s.ctx, serverCtx, s))
@@ -156,7 +156,7 @@ func (sc *ServerConn) Close() {
 		}
 
 		// remove connection from server
-		sc.belong.conns.Remove(sc.netid)
+		sc.belong.conns.Delete(sc.netid)
 		addTotalConn(-1)
 
 		// close net.Conn, any blocked read or write operation will be unblocked and
@@ -283,6 +283,9 @@ func NewClientConn(netid int64, c net.Conn, opt ...ServerOption) *ClientConn {
 	if opts.codec == nil {
 		opts.codec = TypeLengthValueCodec{}
 	}
+	if opts.bufferSize <= 0 {
+		opts.bufferSize = BufferSize256
+	}
 	return newClientConnWithOptions(netid, c, opts)
 }
 
@@ -294,8 +297,8 @@ func newClientConnWithOptions(netid int64, c net.Conn, opts options) *ClientConn
 		rawConn:   c,
 		once:      &sync.Once{},
 		wg:        &sync.WaitGroup{},
-		sendCh:    make(chan []byte, 1024),
-		handlerCh: make(chan MessageHandler, 1024),
+		sendCh:    make(chan []byte, opts.bufferSize),
+		handlerCh: make(chan MessageHandler, opts.bufferSize),
 		heart:     time.Now().UnixNano(),
 	}
 	cc.ctx, cc.cancel = context.WithCancel(context.Background())
@@ -509,17 +512,15 @@ func runEvery(ctx context.Context, netID int64, timing *TimingWheel, d time.Dura
 	return timing.AddTimer(delay, d, timeout)
 }
 
-func asyncWrite(c interface{}, m Message) error {
-	defer func() error {
+func asyncWrite(c interface{}, m Message) (err error) {
+	defer func() {
 		if p := recover(); p != nil {
-			return ErrServerClosed
+			err = ErrServerClosed
 		}
-		return nil
 	}()
 
 	var (
 		pkt    []byte
-		err    error
 		sendCh chan []byte
 	)
 	switch c := c.(type) {
@@ -534,15 +535,16 @@ func asyncWrite(c interface{}, m Message) error {
 
 	if err != nil {
 		holmes.Errorf("asyncWrite error %v\n", err)
-		return err
+		return
 	}
 
 	select {
 	case sendCh <- pkt:
-		return nil
+		err = nil
 	default:
-		return ErrWouldBlock
+		err = ErrWouldBlock
 	}
+	return
 }
 
 /* readLoop() blocking read from connection, deserialize bytes into message,
@@ -700,6 +702,7 @@ func handleLoop(c WriteCloser, wg *sync.WaitGroup) {
 		netID        int64
 		ctx          context.Context
 		askForWorker bool
+		err          error
 	)
 
 	switch c := c.(type) {
@@ -741,9 +744,12 @@ func handleLoop(c WriteCloser, wg *sync.WaitGroup) {
 			msg, handler := msgHandler.message, msgHandler.handler
 			if handler != nil {
 				if askForWorker {
-					WorkerPoolInstance().Put(netID, func() {
+					err = WorkerPoolInstance().Put(netID, func() {
 						handler(NewContextWithNetID(NewContextWithMessage(ctx, msg), netID), c)
 					})
+					if err != nil {
+						holmes.Errorln(err)
+					}
 					addTotalHandle()
 				} else {
 					handler(NewContextWithNetID(NewContextWithMessage(ctx, msg), netID), c)
@@ -756,9 +762,12 @@ func handleLoop(c WriteCloser, wg *sync.WaitGroup) {
 					holmes.Errorf("timeout net %d, conn net %d, mismatched!\n", timeoutNetID, netID)
 				}
 				if askForWorker {
-					WorkerPoolInstance().Put(netID, func() {
+					err = WorkerPoolInstance().Put(netID, func() {
 						timeout.Callback(time.Now(), c.(WriteCloser))
 					})
+					if err != nil {
+						holmes.Errorln(err)
+					}
 				} else {
 					timeout.Callback(time.Now(), c.(WriteCloser))
 				}

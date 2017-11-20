@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -15,7 +14,6 @@ import (
 )
 
 func init() {
-	flag.Parse()
 	netIdentifier = NewAtomicInt64(0)
 }
 
@@ -25,13 +23,15 @@ var (
 )
 
 type options struct {
-	tlsCfg    *tls.Config
-	codec     Codec
-	onConnect onConnectFunc
-	onMessage onMessageFunc
-	onClose   onCloseFunc
-	onError   onErrorFunc
-	reconnect bool // for ClientConn use only
+	tlsCfg     *tls.Config
+	codec      Codec
+	onConnect  onConnectFunc
+	onMessage  onMessageFunc
+	onClose    onCloseFunc
+	onError    onErrorFunc
+	workerSize int  // numbers of worker go-routines
+	bufferSize int  // size of buffered channel
+	reconnect  bool // for ClientConn use only
 }
 
 // ServerOption sets server options.
@@ -56,6 +56,22 @@ func CustomCodecOption(codec Codec) ServerOption {
 func TLSCredsOption(config *tls.Config) ServerOption {
 	return func(o *options) {
 		o.tlsCfg = config
+	}
+}
+
+// WorkerSizeOption returns a ServerOption that will set the number of go-routines
+// in WorkerPool.
+func WorkerSizeOption(workerSz int) ServerOption {
+	return func(o *options) {
+		o.workerSize = workerSz
+	}
+}
+
+// BufferSizeOption returns a ServerOption that is the size of buffered channel,
+// for example an indicator of BufferSize256 means a size of 256.
+func BufferSizeOption(indicator int) ServerOption {
+	return func(o *options) {
+		o.bufferSize = indicator
 	}
 }
 
@@ -96,7 +112,7 @@ type Server struct {
 	opts   options
 	ctx    context.Context
 	cancel context.CancelFunc
-	conns  *ConnMap
+	conns  *sync.Map
 	timing *TimingWheel
 	wg     *sync.WaitGroup
 	mu     sync.Mutex // guards following
@@ -113,13 +129,23 @@ func NewServer(opt ...ServerOption) *Server {
 	for _, o := range opt {
 		o(&opts)
 	}
+
 	if opts.codec == nil {
 		opts.codec = TypeLengthValueCodec{}
 	}
+	if opts.workerSize <= 0 {
+		opts.workerSize = defaultWorkersNum
+	}
+	if opts.bufferSize <= 0 {
+		opts.bufferSize = BufferSize256
+	}
+
+	// initiates go-routine pool instance
+	globalWorkerPool = newWorkerPool(opts.workerSize)
 
 	s := &Server{
 		opts:  opts,
-		conns: NewConnMap(),
+		conns: &sync.Map{},
 		wg:    &sync.WaitGroup{},
 		lis:   make(map[net.Listener]bool),
 	}
@@ -128,9 +154,14 @@ func NewServer(opt ...ServerOption) *Server {
 	return s
 }
 
-// ConnsMap returns connections managed.
-func (s *Server) ConnsMap() *ConnMap {
-	return s.conns
+// ConnsSize returns connections size.
+func (s *Server) ConnsSize() int {
+	var sz int
+	s.conns.Range(func(k, v interface{}) bool {
+		sz++
+		return true
+	})
+	return sz
 }
 
 // Sched sets a callback to invoke every duration.
@@ -143,32 +174,32 @@ func (s *Server) Sched(dur time.Duration, sched func(time.Time, WriteCloser)) {
 
 // Broadcast broadcasts message to all server connections managed.
 func (s *Server) Broadcast(msg Message) {
-	s.conns.RLock()
-	defer s.conns.RUnlock()
-	for _, c := range s.conns.m {
+	s.conns.Range(func(k, v interface{}) bool {
+		c := v.(*ServerConn)
 		if err := c.Write(msg); err != nil {
-			holmes.Errorf("broadcast error %v\n", err)
+			holmes.Errorf("broadcast error %v, conn id %d", err, k.(int64))
+			return false
 		}
-	}
+		return true
+	})
 }
 
 // Unicast unicasts message to a specified conn.
 func (s *Server) Unicast(id int64, msg Message) error {
-	s.conns.RLock()
-	defer s.conns.RUnlock()
-	c, ok := s.conns.m[id]
+	v, ok := s.conns.Load(id)
 	if ok {
-		return c.Write(msg)
+		return v.(*ServerConn).Write(msg)
 	}
-	return fmt.Errorf("conn %d not found", id)
+	return fmt.Errorf("conn id %d not found", id)
 }
 
 // Conn returns a server connection with specified ID.
 func (s *Server) Conn(id int64) (*ServerConn, bool) {
-	s.conns.RLock()
-	defer s.conns.RUnlock()
-	sc, ok := s.conns.m[id]
-	return sc, ok
+	v, ok := s.conns.Load(id)
+	if ok {
+		return v.(*ServerConn), ok
+	}
+	return nil, ok
 }
 
 // Start starts the TCP server, accepting new clients and creating service
@@ -224,7 +255,7 @@ func (s *Server) Start(l net.Listener) error {
 		tempDelay = 0
 
 		// how many connections do we have ?
-		sz := s.conns.Size()
+		sz := s.ConnsSize()
 		if sz >= MaxConnections {
 			holmes.Warnf("max connections size %d, refuse\n", sz)
 			rawConn.Close()
@@ -245,7 +276,7 @@ func (s *Server) Start(l net.Listener) error {
 		}
 		s.mu.Unlock()
 
-		s.conns.Put(netid, sc)
+		s.conns.Store(netid, sc)
 		addTotalConn(1)
 
 		s.wg.Add(1) // this will be Done() in ServerConn.Close()
@@ -253,12 +284,13 @@ func (s *Server) Start(l net.Listener) error {
 			sc.Start()
 		}()
 
-		holmes.Infof("accepted client %s, id %d, total %d\n", sc.Name(), netid, s.conns.Size())
-		s.conns.RLock()
-		for _, c := range s.conns.m {
-			holmes.Infof("client %s\n", c.Name())
-		}
-		s.conns.RUnlock()
+		holmes.Infof("accepted client %s, id %d, total %d\n", sc.Name(), netid, s.ConnsSize())
+		s.conns.Range(func(k, v interface{}) bool {
+			i := k.(int64)
+			c := v.(*ServerConn)
+			holmes.Infof("client(%d) %s", i, c.Name())
+			return true
+		})
 	} // for loop
 }
 
@@ -278,12 +310,15 @@ func (s *Server) Stop() {
 
 	// close all connections
 	conns := map[int64]*ServerConn{}
-	s.conns.RLock()
-	for k, v := range s.conns.m {
-		conns[k] = v
-	}
-	s.conns.RUnlock()
-	s.conns.Clear()
+
+	s.conns.Range(func(k, v interface{}) bool {
+		i := k.(int64)
+		c := v.(*ServerConn)
+		conns[i] = c
+		return true
+	})
+	// let GC do the cleanings
+	s.conns = nil
 
 	for _, c := range conns {
 		c.rawConn.Close()
@@ -313,10 +348,11 @@ func (s *Server) timeOutLoop() {
 
 		case timeout := <-s.timing.TimeOutChannel():
 			netID := timeout.Ctx.Value(netIDCtx).(int64)
-			if sc, ok := s.conns.Get(netID); ok {
+			if v, ok := s.conns.Load(netID); ok {
+				sc := v.(*ServerConn)
 				sc.timerCh <- timeout
 			} else {
-				holmes.Warnf("invalid client %d\n", netID)
+				holmes.Warnf("invalid client %d", netID)
 			}
 		}
 	}
